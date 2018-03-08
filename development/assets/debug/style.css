@@ -1,0 +1,38 @@
+body {
+	background: #242424;
+	color: rgb(40, 140, 196);
+}
+
+table {
+	width: 95%;
+	border: none;
+}
+
+td {
+	border: 1px solid #464646;
+	font-size: 14px;
+	background: rgb(40, 40, 40);
+	color: rgb(160, 160, 160);
+	padding: 4px 8px 4px 8px;
+	font-family: Monospace;
+}
+
+.colhead td {
+	background: rgb(10, 10, 10);
+}
+
+.message td {
+	background: rgb(50, 50, 50);
+}
+
+.warning td {
+	border: 1px solid #FFFF00;
+}
+
+.error td {
+	border: 1px solid #FF0000;
+}
+
+.info td {
+	border: 1px solid rgba(20, 200, 200, 0.9);
+}
