@@ -1,4 +1,5 @@
 #include "assets.hpp"
+#include "psim.hpp"
 
 #include <engine.hpp>
 
@@ -49,7 +50,7 @@ shader_assets& _shaders() {
 void texture_assets::initialize() {
 	root("assets/textures");
 	load({ &blank, "blank.png" });
-	load({ &world, "world.png", 1, TEXTURE_PIXELS_IN_MEMORY });
+	load({ &world, STRING(WORLD_SIZE << ".png"), 1, TEXTURE_PIXELS_IN_MEMORY });
 	spawn_thread();
 	finish();
 }

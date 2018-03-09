@@ -1,11 +1,24 @@
 #include "psim.hpp"
 #include <engine.hpp>
-#include <graphics.hpp>
+#include <memory.hpp>
+#include <platform.hpp>
 #include <fstream>
+#include <bitset>
 
 psim::psim() {
 	rng = std::mt19937_64(time(nullptr));
 	rng_direction = std::uniform_int_distribution<int>(0, 7);
+	
+	if (!std::experimental::filesystem::is_directory("stats")) {
+		std::experimental::filesystem::create_directory("stats");
+	}
+
+#if RECORD_ENABLED || REPLAY_ENABLED
+	if (WORLD_SIZE > 2048) {
+		NE_ERROR("Cannot have world size over 2048 when recording is enabled.");
+		std::exit(1);
+	}
+#endif
 
 	ani.create();
 	ani.pixels = new uint32[WORLD_SIZE * WORLD_SIZE];
@@ -13,9 +26,7 @@ psim::psim() {
 	memcpy(ani.pixels, textures.world.pixels, sizeof(uint32) * WORLD_SIZE * WORLD_SIZE);
 	ani.render();
 
-#if LOG_ENABLED
-	log.reserve(1000000);
-#endif
+#if !REPLAY_ENABLED
 	cells.insert(cells.begin(), WORLD_SIZE * WORLD_SIZE, {});
 	for (int i = 0; i < INITIAL_BEAR_COUNT; i++) {
 		while (true) {
@@ -25,9 +36,12 @@ psim::psim() {
 			if (TERRAIN_AT(j) == WATER || cells[j].animal == BEAR) {
 				continue;
 			}
-			cells[j] = { -1, (uint8)ne::random_int(BEAR_MAX_AGE), 0.0f, BEAR};
+			cells[j] = { -1, (uint8)ne::random_int(BEAR_MAX_AGE), ne::random_float(0.0f, 0.5f), BEAR};
 			bears.push_back(j);
 			ani.pixels[j] = BEAR;
+#if RECORD_ENABLED
+			replay.push(year, ticks, j, ani.pixels[j]);
+#endif
 			break;
 		}
 	}
@@ -39,9 +53,12 @@ psim::psim() {
 			if (TERRAIN_AT(j) != WATER || cells[j].animal != 0) {
 				continue;
 			}
-			cells[j] = { -1, (uint8)ne::random_int(SEAL_MAX_AGE), 0.0f, SEAL};
+			cells[j] = { -1, (uint8)ne::random_int(SEAL_MAX_AGE), ne::random_float(0.0f, 0.5f), SEAL};
 			seals.push_back(j);
 			ani.pixels[j] = SEAL;
+#if RECORD_ENABLED
+			replay.push(year, ticks, j, ani.pixels[j]);
+#endif
 			break;
 		}
 	}
@@ -59,21 +76,96 @@ psim::psim() {
 #if LOG_ENABLED
 	ne::listen([&](ne::keyboard_key_message key) {
 		if (key.is_pressed && key.key == KEY_0) {
-			std::ofstream of(STRING(time(nullptr) << ".csv"));
-			of << "Age;Hunger;Animal;TimeOfDeath;\n";
-			for (auto& i : log) {
-				of << (int)i.age_dead << ";";
-				of << i.hunger_dead << ";";
+			const time_t t = time(nullptr) - 1520561000;
+			std::ofstream of(STRING("stats/deaths_" << t << ".csv"));
+			of << "Reason;Age;Hunger;Animal;Tick;\n";
+			for (auto& i : log.deaths) {
+				switch (i.reason) {
+				case LOG_DEATH_RANDOM: of << "Random;"; break;
+				case LOG_DEATH_EATEN: of << "Eaten;"; break;
+				case LOG_DEATH_STARVED: of << "Starved;"; break;
+				case LOG_DEATH_AGED: of << "Aged;"; break;
+				default: of << "Unknown;"; break;
+				}
+				of << (int)i.age << ";";
+				of << i.hunger << ";";
 				if (i.animal == BEAR) {
 					of << "Bear;";
 				} else if (i.animal == SEAL) {
 					of << "Seal;";
+				} else {
+					of << "Unknown;";
 				}
-				of << i.time_of_death << ";\n";
+				of << i.tick<< ";\n";
+			}
+			of = std::ofstream(STRING("stats/births_" << t << ".csv"));
+			of << "Animal;Tick;\n";
+			for (auto& i : log.births) {
+				if (i.animal == BEAR) {
+					of << "Bear;";
+				} else if (i.animal == SEAL) {
+					of << "Seal;";
+				} else {
+					of << "Unknown";
+				}
+				of << i.tick << ";\n";
 			}
 		}
 	});
 #endif
+#endif
+	ne::listen([&](ne::keyboard_key_message key) {
+		if (!key.is_pressed) {
+			return;
+		}
+		if (key.key == KEY_O) {
+#if RECORD_ENABLED
+			ne::memory_buffer buffer;
+			buffer.write_uint32(replay.years.size());
+			for (auto& i : replay.years) {
+				for (auto& j : i.ticks) {
+					buffer.write_uint32(j.cells.size());
+					for (auto& k : j.cells) {
+						// TODO: Remove duplicates that are overwritten
+						uint32 data = (k.index | (k.pixel << 2));
+						buffer.write_uint8(data >> 16);
+						buffer.write_uint8(data >> 8);
+						buffer.write_uint8(data);
+					}
+				}
+			}
+			const time_t t = time(nullptr) - 1520561000;
+			ne::write_file(STRING("stats/" << t << ".re"), buffer.begin, buffer.write_index());
+			buffer.free();
+#endif
+		} else if (key.key == KEY_P) {
+#if REPLAY_ENABLED
+			if (!ne::file_exists(LOAD_REPLAY)) {
+				return;
+			}
+			ne::memory_buffer buffer;
+			ne::read_file(LOAD_REPLAY, &buffer);
+			for (size_t i = 0; i < WORLD_SIZE * WORLD_SIZE; i++) {
+				replay.push(year, ticks, i, ani.pixels[i]);
+			}
+			uint32 year_count = buffer.read_uint32();
+			for (uint32 i = 0; i < year_count; i++) {
+				replay.years.push_back({});
+				for (uint32 j = 0; j < TICKS_PER_YEAR; j++) {
+					uint32 cell_count = buffer.read_uint32();
+					for (uint32 k = 0; k < cell_count; k++) {
+						uint8 b0 = buffer.read_uint8();
+						uint8 b1 = buffer.read_uint8();
+						uint8 b2 = buffer.read_uint8();
+						uint32_t data = (b0 << 16) | (b1 << 8) | b2;
+						replay.years[i].ticks[j].cells.push_back({ data & ((1 << 2) - 1), data >> 2 });
+					}
+				}
+			}
+			buffer.free();
+#endif
+		}
+	});
 }
 
 void psim::look(int index, look_info& info) {
@@ -101,6 +193,10 @@ bool psim::try_move(int ref_i, int x, int y, uint32 terrain) {
 		ani.pixels[cell_i] = TERRAIN_AT(cell_i);
 		std::swap(cells[move_index], cells[cell_i]);
 		ani.pixels[move_index] = cells[move_index].animal;
+#if RECORD_ENABLED
+		replay.push(year, ticks, cell_i, ani.pixels[cell_i]);
+		replay.push(year, ticks, move_index, ani.pixels[move_index]);
+#endif
 		cell_i = move_index;
 		return true;
 	}
@@ -124,11 +220,16 @@ bool psim::move(int ref_i, look_info& info, uint32 terrain, int direction) {
 bool psim::try_birth(int cell_i, int x, int y, uint32 terrain) {
 	const int birth_index = x + y * WORLD_SIZE;
 	if (TERRAIN_AT(birth_index) == terrain && cells[birth_index].animal == 0) {
-		cells[birth_index] = { -1, 0, 0.0f, cells[cell_i].animal/*, -1*/ };
+		cells[birth_index] = { -1, 0, 0.0f, cells[cell_i].animal };
 		ani.pixels[birth_index] = cells[cell_i].animal;
+#if LOG_ENABLED
+		log.birth(cells[birth_index].animal, ticks);
+#endif
+#if RECORD_ENABLED
+		replay.push(year, ticks, birth_index, ani.pixels[birth_index]);
+#endif
 		to_add->push_back(birth_index);
 		stats.animals->born++;
-		// TODO: log
 		return true;
 	}
 	return false;
@@ -157,17 +258,22 @@ void psim::breed(int cell_i, look_info& info, int amount, uint32 terrain) {
 bool psim::try_hunt(int cell_i, int x, int y) {
 	const int hunt_index = x + y * WORLD_SIZE;
 	if (cells[hunt_index].animal == SEAL) {
-		cells[cell_i].hunger = 0.0f;
+		cells[cell_i].hunger /= 2.0f;
 		for (size_t i = 0; i < seals.size(); i++) {
 			if (seals[i] == hunt_index) {
 				SWAP_AND_POP(seals, i);
 				break;
 			}
 		}
+#if LOG_ENABLED
+		log.death(LOG_DEATH_EATEN, cells[hunt_index].age, cells[hunt_index].hunger, cells[hunt_index].animal, ticks);
+#endif
 		cells[hunt_index] = {};
 		ani.pixels[hunt_index] = TERRAIN_AT(hunt_index);
+#if RECORD_ENABLED
+		replay.push(year, ticks, hunt_index, ani.pixels[hunt_index]);
+#endif
 		stats.seals_eaten_by_bears++;
-		// TODO: log
 		return true;
 	}
 	return false;
@@ -185,57 +291,65 @@ bool psim::hunt(int cell_i, look_info& info) {
 	return false;
 }
 
-void psim::kill_random(float chance) {
-	if (!ne::random_chance(chance)) {
-		return;
-	}
-	for (size_t i = 100; i < animals->size(); i++) {
-#if LOG_ENABLED
-		log.push_back({ i.second->age, i.second->hunger, i.second->animal, ticks });
-#endif
+void psim::kill(int per_year) {
+	const float per_tick = (float)per_year / (float)TICKS_PER_YEAR;
+	stats.animals->kill_chance += per_tick;
+	for (size_t i = 0; i < animals->size() && stats.animals->kill_chance >= 1.0f; i++) {
 		int cell_i = (*animals)[i];
+#if LOG_ENABLED
+		log.death(LOG_DEATH_RANDOM, cells[cell_i].age, cells[cell_i].hunger, cells[cell_i].animal, ticks);
+#endif
 		cells[cell_i] = {};
 		ani.pixels[cell_i] = TERRAIN_AT(cell_i);
+#if RECORD_ENABLED
+		replay.push(year, ticks, cell_i, ani.pixels[cell_i]);
+#endif
 		SWAP_AND_POP(*animals, i);
 		stats.animals->dead_randomly++;
-		break;
+		stats.animals->kill_chance--;
 	}
 }
 
 void psim::update_bears() {
 	look_info info;
 	SET_ANIMAL(bears);
-	kill_random(RANDOM_BEAR_DEATH_CHANCE);
+	kill(BEARS_DEAD_PER_YEAR);
 	for (int ref_i = 0; ref_i < bears.size(); ref_i++) {
 		int& cell_i = bears[ref_i];
 		auto& bear = cells[cell_i];
 		look(cell_i, info);
-		bear.hunger += HUNGER_TO_DIE_IN_A_YEAR * 0.2f;
+		bear.hunger += BEAR_HUNGER_RATE;
 		if (bear.hunger > 1.0f) {
 #if LOG_ENABLED
-			log.push_back({ bear.age, bear.hunger, bear.animal, ticks });
+			log.death(LOG_DEATH_STARVED, bear.age, bear.hunger, bear.animal, ticks);
 #endif
 			stats.bears.dead_from_hunger++;
 			bear = {};
 			ani.pixels[cell_i] = TERRAIN_AT(cell_i);
+#if RECORD_ENABLED
+			replay.push(year, ticks, cell_i, ani.pixels[cell_i]);
+#endif
 			SWAP_AND_POP(bears, ref_i);
 			ref_i--;
 			continue;
 		}
-		if (bear.hunger > 0.2f) {
-			hunt(cell_i, info);
+		hunt(cell_i, info);
+		if (bear.direction == -1) {
+			bear.direction = RANDOM_DIRECTION;
+		}
+		if (bear.hunger > BEAR_HUNGER_HUNGRY) {
 			if (TERRAIN_AT(cell_i) == GROUND) {
-				if (move(ref_i, info, WATER, RANDOM_DIRECTION)) {
+				if (move(ref_i, info, WATER, bear.direction)) {
+					bear.direction = -1;
 					continue;
 				}
 			}
-			int direction = RANDOM_DIRECTION;
-			if (move(ref_i, info, GROUND, direction)) {
+			if (move(ref_i, info, GROUND, bear.direction)) {
 				continue;
 			}
 		}
-		if (move(ref_i, info, GROUND, RANDOM_DIRECTION)) {
-			continue;
+		if (!move(ref_i, info, GROUND, bear.direction)) {
+			bear.direction = -1;
 		}
 	}
 	if (new_year) {
@@ -244,8 +358,14 @@ void psim::update_bears() {
 			auto& bear = cells[cell_i];
 			if (++bear.age >= BEAR_BREED_AGE) {
 				if (bear.age > BEAR_MAX_AGE) {
+#if LOG_ENABLED
+					log.death(LOG_DEATH_AGED, bear.age, bear.hunger, bear.animal, ticks);
+#endif
 					cells[cell_i] = {};
 					ani.pixels[cell_i] = TERRAIN_AT(cell_i);
+#if RECORD_ENABLED
+					replay.push(year, ticks, cell_i, ani.pixels[cell_i]);
+#endif
 					SWAP_AND_POP(bears, ref_i);
 					ref_i--;
 					stats.bears.dead_from_age++;
@@ -268,16 +388,39 @@ void psim::update_bears() {
 void psim::update_seals() {
 	look_info info;
 	SET_ANIMAL(seals);
-	kill_random(RANDOM_SEAL_DEATH_CHANCE);
+	kill(SEALS_DEAD_PER_YEAR);
 	for (int ref_i = 0; ref_i < seals.size(); ref_i++) {
 		int& cell_i = seals[ref_i];
 		auto& seal = cells[cell_i];
 		look(cell_i, info);
-		seal.hunger += HUNGER_TO_DIE_IN_A_YEAR * 0.1f;
+		seal.hunger += SEAL_HUNGER_RATE;
+		if (new_year) {
+			seal.age++;
+		}
 		if (TERRAIN_AT(cell_i) == GROUND) {
 			if (seal.hunger > 0.1f) {
 				seal.hunger -= 0.01f;
 			} else {
+				if (seal.age >= SEAL_BREED_AGE) {
+					if (seal.age > SEAL_MAX_AGE) {
+#if LOG_ENABLED
+						log.death(LOG_DEATH_AGED, seal.age, seal.hunger, seal.animal, ticks);
+#endif
+						cells[cell_i] = {};
+						ani.pixels[cell_i] = TERRAIN_AT(cell_i);
+#if RECORD_ENABLED
+						replay.push(year, ticks, cell_i, ani.pixels[cell_i]);
+#endif
+						SWAP_AND_POP(seals, ref_i);
+						ref_i--;
+						stats.seals.dead_from_age++;
+						continue;
+					}
+					int amount = can_breed(SEAL_BREED_PROBABILITY, 2);
+					if (amount > 0) {
+						breed(cell_i, info, amount, WATER);
+					}
+				}
 				if (move(ref_i, info, WATER, RANDOM_DIRECTION)) {
 					seal.hunger = 0.0f;
 					continue;
@@ -289,16 +432,19 @@ void psim::update_seals() {
 		}
 		if (seal.hunger > 1.0f) {
 #if LOG_ENABLED
-			log.push_back({ seal.age, seal.hunger, seal.animal, ticks });
+			log.death(LOG_DEATH_STARVED, seal.age, seal.hunger, seal.animal, ticks);
 #endif
 			stats.seals.dead_from_hunger++;
 			seal = {};
 			ani.pixels[cell_i] = TERRAIN_AT(cell_i);
+#if RECORD_ENABLED
+			replay.push(year, ticks, cell_i, ani.pixels[cell_i]);
+#endif
 			SWAP_AND_POP(seals, ref_i);
 			ref_i--;
 			continue;
 		}
-		if (seal.hunger > 0.3f) {
+		if (seal.hunger > SEAL_HUNGER_HUNGRY) {
 			if (seal.direction == -1) {
 				seal.direction = RANDOM_DIRECTION;
 			}
@@ -319,29 +465,6 @@ void psim::update_seals() {
 			continue;
 		}
 	}
-	if (new_year) {
-		for (int ref_i = 0; ref_i < seals.size(); ref_i++) {
-			int cell_i = seals[ref_i];
-			auto& seal = cells[cell_i];
-			if (++seal.age >= SEAL_BREED_AGE) {
-				if (seal.age > SEAL_MAX_AGE) {
-					cells[cell_i] = {};
-					ani.pixels[cell_i] = TERRAIN_AT(cell_i);
-					SWAP_AND_POP(seals, ref_i);
-					ref_i--;
-					stats.seals.dead_from_age++;
-					continue;
-				}
-				if (TERRAIN_AT(cell_i) == GROUND) {
-					int amount = can_breed(SEAL_BREED_PROBABILITY, 2);
-					if (amount > 0) {
-						look(cell_i, info);
-						breed(cell_i, info, amount, WATER);
-					}
-				}
-			}
-		}
-	}
 	for (auto& i : seals_to_add) {
 		seals.push_back(i);
 	}
@@ -349,14 +472,26 @@ void psim::update_seals() {
 }
 
 void psim::update() {
+#if !SIM_AUTO
 	if (!ne::is_key_down(KEY_SPACE)) {
 		return;
 	}
+#endif
 	int old_year = year;
 	year = ticks / TICKS_PER_YEAR;
 	new_year = (old_year != year);
+#if REPLAY_ENABLED
+	replay_tick current_tick = replay.pop();
+	if (current_tick.cells.size() == 0) {
+		NE_WARNING_LIMIT("No more ticks in recording.", 1);
+	}
+	for (auto& i : current_tick.cells) {
+		ani.pixels[i.index] = PIXEL_INDEX_TO_PIXEL(i.pixel);
+	}
+#else
 	update_bears();
 	update_seals();
+#endif
 	ticks++;
 }
 
@@ -368,6 +503,7 @@ void psim::draw() {
 	ani.bind();
 	ani.refresh();
 	ne::drawing_shape::bound()->draw();
+#if !REPLAY_ENABLED
 	if (bb.refs && bb.ref_i != -1) {
 		if (bb.ref_i >= bb.refs->size() || bb.ref_i < 0) {
 			bb.ref_i = -1;
@@ -388,7 +524,26 @@ void psim::draw() {
 		ne::shader::set_transform(&bb.transform);
 		ne::drawing_shape::bound()->draw();
 		ne::ortho_camera::bound()->target = &bb.transform;
+		bb.info.font = &fonts.debug;
+		bool rendered = bb.info.render(STRING(
+			"Hunger: " << (int)(cells[cell_i].hunger * 100.0f) <<
+			"\nAge: " << (int)cells[cell_i].age
+		));
+		bb.info.transform.position = bb.transform.position;
+		if (rendered) {
+			bb.info.transform.scale.x /= 4.0f;
+			bb.info.transform.scale.y /= 4.0f;
+		}
+		bb.info.transform.position.x -= bb.info.transform.scale.width / 2.0f;
+		bb.info.transform.position.y -= bb.info.transform.scale.height;
+		ne::shader::set_color({ 0.0f, 0.0f, 0.0f, 1.0f });
+		bb.info.draw();
+		bb.info.transform.position.x -= 0.25f;
+		bb.info.transform.position.y -= 0.25f;
+		ne::shader::set_color({ 1.0f, 0.0f, 1.0f, 1.0f });
+		bb.info.draw();
 	} else {
 		ne::ortho_camera::bound()->target = nullptr;
 	}
+#endif
 }

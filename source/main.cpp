@@ -20,13 +20,6 @@ public:
 	psim sim;
 
 	sim_state::sim_state() {
-		for (int i = 0; i < WORLD_SIZE * WORLD_SIZE; i++) {
-			if (TERRAIN_AT(i) != WATER) {
-				TERRAIN_AT(i) = GROUND;
-			}
-		}
-		textures.world.parameters.are_pixels_in_memory = false;
-		textures.world.render();
 		camera.zoom = 2.0f;
 		camera.target_chase_speed = 2.0f;
 		camera.target_chase_aspect = 2.0f;
@@ -43,6 +36,9 @@ public:
 		ne::listen([this](ne::keyboard_key_message key) {
 			if (key.is_pressed && key.key == KEY_R) {
 				camera.transform.position.xy = -100.0f;
+				camera.zoom = 1.0f;
+				sim.bb.refs = nullptr;
+				sim.bb.ref_i = -1;
 			}
 		});
 	}
@@ -79,7 +75,8 @@ public:
 				"\nSeals dead randomly: " << sim.stats.seals.dead_randomly <<
 				"\nBears dead randomly: " << sim.stats.bears.dead_randomly <<
 				"\nSeals eaten by bears: " << sim.stats.seals_eaten_by_bears <<
-				"\n\nYear: " << sim.year
+				"\n\nYear: " << sim.year <<
+				"\nDay: " << (int)((float)(sim.ticks % 500) * 0.73f)
 			));
 		} else {
 			debug.set(&fonts.debug, STRING(
@@ -87,7 +84,8 @@ public:
 				"\nFPS: " << ne::current_fps() <<
 				"\nBears: " << sim.bears.size() <<
 				"\nSeals: " << sim.seals.size() <<
-				"\n\nYear: " << sim.year
+				"\n\nYear: " << sim.year <<
+				"\nDay: " << (int)((float)(sim.ticks % 500) * 0.73f)
 			));
 		}
 	}
@@ -125,6 +123,13 @@ void start() {
 	ne::set_update_sync(false);
 	ne::set_max_update_count(MAX_TICKS_PER_DRAW);
 	ne::set_swap_interval(ne::swap_interval::immediate);
+	for (int i = 0; i < WORLD_SIZE * WORLD_SIZE; i++) {
+		if (TERRAIN_AT(i) != WATER) {
+			TERRAIN_AT(i) = GROUND;
+		}
+	}
+	textures.world.parameters.are_pixels_in_memory = false;
+	textures.world.render();
 	ne::swap_state<sim_state>();
 }
 
